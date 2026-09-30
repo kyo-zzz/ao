@@ -1,5 +1,11 @@
 name: Build Docs
 
+# No pull_request trigger: the doc preview writes to S3 as role/arc, and a fork
+# PR gets no OIDC token to assume it, so every fork run would fail. A PR gets
+# the ciflow/docs label instead -- applied automatically by .github/labeler.yml
+# for the paths that affect docs -- which tags the PR head and fires the push
+# trigger below with the PR's own SHA, from the base repo. Matches
+# pytorch/pytorch and pytorch/executorch.
 on:
   push:
     branches:
@@ -9,9 +15,7 @@ on:
     tags:
       - v[0-9]+.[0-9]+.[0-9]
       - v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+
-  pull_request:
-    paths:
-      - 'docs/**'
+      - ciflow/docs/*
   workflow_dispatch:
 
 concurrency:
@@ -62,7 +66,7 @@ jobs:
     container:
       image: docker.io/python:3.11-slim
     needs: build_docs
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/ciflow/docs/') }}
     permissions:
       pull-requests: write
       id-token: write
@@ -74,6 +78,24 @@ jobs:
         with:
           name: Doc-Build
           path: docs
+      # A ciflow tag is ciflow/docs/<pr>, so it names the pull request the
+      # preview belongs to and the upload keeps the same per-PR prefix it used
+      # on pull_request events. A manual dispatch has no pull request, so it
+      # falls back to the run id and the comment step looks the PR up by branch.
+      - name: Resolve the preview prefix
+        id: preview
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF}" == refs/tags/ciflow/docs/* ]]; then
+            prefix="${GITHUB_REF##*/}"
+            echo "pr=${prefix}" >> "${GITHUB_OUTPUT}"
+          else
+            prefix="${GITHUB_RUN_ID}"
+          fi
+
+          echo "prefix=${prefix}" >> "${GITHUB_OUTPUT}"
+          echo "url=https://docs-preview.pytorch.org/pytorch/ao/${prefix}/index.html" >> "${GITHUB_OUTPUT}"
       # The S3 write used to come from the EC2 instance role. A pod has no
       # instance role, so ask for the credentials explicitly.
       - name: Configure AWS credentials
@@ -84,43 +106,41 @@ jobs:
 
       - name: Upload docs preview
         uses: seemethere/upload-artifact-s3@v5
-        if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
         with:
           retention-days: 14
           s3-bucket: doc-previews
           if-no-files-found: error
           path: docs
-          s3-prefix: pytorch/ao/${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
-      - name: Get preview URL
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        id: preview-url
-        run: |
-          echo "url=https://docs-preview.pytorch.org/pytorch/ao/${{ github.run_id }}/index.html" >> $GITHUB_OUTPUT
-      - name: Find associated PR and post comment
-        if: ${{ github.event_name == 'workflow_dispatch' }}
+          s3-prefix: pytorch/ao/${{ steps.preview.outputs.prefix }}
+      - name: Post the preview link
         uses: actions/github-script@v7
+        env:
+          PREVIEW_URL: ${{ steps.preview.outputs.url }}
+          PREVIEW_PR: ${{ steps.preview.outputs.pr }}
         with:
           script: |
-            const prs = await github.rest.pulls.list({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              head: `${context.repo.owner}:${context.ref.replace('refs/heads/', '')}`,
-              state: 'open'
-            });
-            console.log(`Found ${prs.data.length} open PRs for branch ${context.ref}`);
-            if (prs.data.length > 0) {
-              const prNumber = prs.data[0].number;
-              console.log(`Posting comment to PR #${prNumber}`);
-              const previewUrl = '${{ steps.preview-url.outputs.url }}';
-              await github.rest.issues.createComment({
+            let prNumber = process.env.PREVIEW_PR;
+            if (!prNumber) {
+              // A dispatch carries no pull request, so find it from the branch.
+              const prs = await github.rest.pulls.list({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: prNumber,
-                body: `## 📄 Doc Preview (workflow_dispatch)\n\nYou triggered a doc build manually via workflow_dispatch.\nThe pytorchbot doc preview link will not work for this build.\n\n**Use this link instead:** ${previewUrl}`
+                head: `${context.repo.owner}:${context.ref.replace('refs/heads/', '')}`,
+                state: 'open'
               });
-            } else {
-              console.log('No open PR found for this branch');
+              if (prs.data.length === 0) {
+                console.log('No open PR found for this branch');
+                return;
+              }
+              prNumber = prs.data[0].number;
             }
+            console.log(`Posting comment to PR #${prNumber}`);
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(prNumber),
+              body: `## 📄 Doc Preview\n\n${process.env.PREVIEW_URL}`
+            });
 
   upload:
     runs-on: ubuntu-latest
